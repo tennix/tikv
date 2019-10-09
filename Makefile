@@ -31,7 +31,7 @@
 #
 # - `release` - create a release profile, optimized build
 
-SHELL := /bin/bash
+SHELL := /usr/bin/env bash
 ENABLE_FEATURES ?=
 
 # Pick an allocator
