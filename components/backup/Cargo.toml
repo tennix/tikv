@@ -13,7 +13,7 @@ crc64fast = "0.1"
 engine = { path = "../engine" }
 engine_rocks = { path = "../engine_rocks" }
 engine_traits = { path = "../engine_traits" }
-external_storage = { path = "../external_storage" }
+external_storage = { path = "../external_storage", features = [ "s3" ] }
 failure = "0.1"
 futures = "0.1"
 grpcio = { version = "0.5.0-alpha.5", features = [ "openssl-vendored" ], default-features = false }
