@@ -16,6 +16,8 @@ use super::ExternalStorage;
 #[derive(Clone)]
 pub struct S3Storage {
     bucket: String,
+    storage_class: Option<String>,
+    acl: Option<String>,
     prefix: String,
     client: S3Client,
 }
@@ -62,6 +64,9 @@ impl S3Storage {
         let mut secret_access_key = None;
         let mut token = None;
         let mut region = None;
+	let mut acl = None;
+	let mut location_constraint = None;
+	let mut storage_class = None;
         for (k, v) in url.query_pairs() {
             match k.as_ref() {
                 "ACCESS_KEY" => {
@@ -79,6 +84,15 @@ impl S3Storage {
                     })?;
                     region = Some(r);
                 }
+		"ACL" => {
+		    acl = Some(v.into_owned());
+		}
+		"STORAGE_CLASS" => {
+		    storage_class = Some(v.into_owned());
+		}
+		"LOCATION_CONSTRAINT" => {
+		    location_constraint = Some(v.into_owned());
+		}
                 "S3_ENDPOINT" => {
                     //TODO: support custom s3 endpoint, such as a local Ceph target.
                 }
@@ -111,12 +125,18 @@ impl S3Storage {
         let region = region.ok_or_else(|| {
             Error::new(ErrorKind::InvalidInput, format!("missing REGION {}", url))
         })?;
+	let storage_class = storage_class.or(Some("STANDARD".to_owned()));
+
+	location_constraint = location_constraint.or(Some(region.name().to_string()));
+	let bucket_config = CreateBucketConfiguration{location_constraint: location_constraint};
 
         let client = S3Client::new_with(dispatcher, static_cred, region);
 
         // Try to create bucket first.
         let req = CreateBucketRequest {
             bucket: bucket.clone(),
+	    acl: acl.clone(),
+	    create_bucket_configuration: Some(bucket_config),
             ..Default::default()
         };
         client
@@ -126,6 +146,8 @@ impl S3Storage {
 
         Ok(S3Storage {
             bucket,
+	    storage_class,
+	    acl,
             prefix,
             client,
         })
@@ -150,6 +172,8 @@ impl ExternalStorage for S3Storage {
             key,
             bucket: self.bucket.clone(),
             body: Some(content.into()),
+	    acl: self.acl.clone(),
+	    storage_class: self.storage_class.clone(),
             ..Default::default()
         };
         self.client
