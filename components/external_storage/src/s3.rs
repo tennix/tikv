@@ -12,13 +12,32 @@ use url::Url;
 
 use super::ExternalStorage;
 
-/// A storage saves files in S3.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum S3Provider {
+    AWS,    // AWS S3
+    Aliyun, // Alibaba Cloud Object Storage System
+    Custom, // Other S3 compatible storage providers like Ceph, Minio etc
+}
+
+impl From<&str> for S3Provider {
+    fn from(provider: &str) -> Self {
+        match provider {
+            "aws" => S3Provider::AWS,
+            "aliyun" => S3Provider::Aliyun,
+            _ => S3Provider::Custom,
+        }
+    }
+}
+
+/// S3 compatible storage
 #[derive(Clone)]
 pub struct S3Storage {
+    provider: S3Provider,
     bucket: String,
+    server_side_encryption: Option<String>,
     storage_class: Option<String>,
     acl: Option<String>,
-    prefix: String,
+    prefix: Option<String>,
     client: S3Client,
 }
 
@@ -43,58 +62,60 @@ impl S3Storage {
         D: DispatchSignedRequest + Send + Sync + 'static,
         D::Future: Send,
     {
-        let bucket = url.host_str().map_or_else(
-            || {
-                Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("missing bucket {}", url),
-                ))
-            },
-            |b| Ok(b.to_string()),
-        )?;
-        let prefix = url.path().trim_matches('/').to_owned();
-        if prefix.contains('/') {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("multi-prefix is not allowed {}", url),
-            ));
-        }
+        // The URL follows the convention in https://gocloud.dev/howto/blob
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing bucket name"))?;
 
+        let mut endpoint = None;
+        let mut prefix = None;
         let mut access_key = None;
         let mut secret_access_key = None;
         let mut token = None;
         let mut region = None;
-	let mut acl = None;
-	let mut location_constraint = None;
-	let mut storage_class = None;
+        let mut acl = None;
+        let mut location_constraint = None;
+        let mut storage_class = Some("STANDARD".to_owned());
+        let mut provider = S3Provider::AWS;
+        let mut insecure = false;
+        let mut server_side_encryption = None;
         for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "ACCESS_KEY" => {
+            match k.to_lowercase().as_ref() {
+                "access_key" => {
                     access_key = Some(v.into_owned());
                 }
-                "SECRET_ACCESS_KEY" => {
+                "secret_access_key" => {
                     secret_access_key = Some(v.into_owned());
                 }
-                "TOKEN" => {
+                "token" => {
                     token = Some(v.into_owned());
                 }
-                "REGION" => {
-                    let r = v.parse::<region::Region>().map_err(|e| {
-                        Error::new(ErrorKind::InvalidInput, format!("{} {}", e, url))
-                    })?;
-                    region = Some(r);
+                "region" => {
+                    region = Some(v.into_owned());
                 }
-		"ACL" => {
-		    acl = Some(v.into_owned());
-		}
-		"STORAGE_CLASS" => {
-		    storage_class = Some(v.into_owned());
-		}
-		"LOCATION_CONSTRAINT" => {
-		    location_constraint = Some(v.into_owned());
-		}
-                "S3_ENDPOINT" => {
-                    //TODO: support custom s3 endpoint, such as a local Ceph target.
+                "acl" => {
+                    acl = Some(v.into_owned());
+                }
+                "storage_class" => {
+                    storage_class = Some(v.into_owned());
+                }
+                "location_constraint" => {
+                    location_constraint = Some(v.into_owned());
+                }
+                "provider" => {
+                    provider = S3Provider::from(v.as_ref());
+                }
+                "insecure" => {
+                    insecure = v.parse::<bool>().unwrap_or(insecure);
+                }
+                "server_side_encryption" => {
+                    server_side_encryption = Some(v.into_owned());
+                }
+                "endpoint" => {
+                    endpoint = Some(v.into_owned());
+                }
+                "prefix" => {
+                    prefix = Some(v.into_owned());
                 }
                 _ => {
                     error!("unknonw s3 query"; "key" => %k, "value" => %v);
@@ -103,18 +124,10 @@ impl S3Storage {
         }
 
         // Create s3 static credential.
-        let access_key = access_key.ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("missing ACCESS_KEY {}", url),
-            )
-        })?;
-        let secret_access_key = secret_access_key.ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("missing SECRET_ACCESS_KEY {}", url),
-            )
-        })?;
+        let access_key =
+            access_key.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing ACCESS_KEY"))?;
+        let secret_access_key = secret_access_key
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing SECRET_ACCESS_KEY"))?;
         let static_cred = StaticProvider::new(
             access_key,
             secret_access_key,
@@ -122,21 +135,62 @@ impl S3Storage {
             None, /* valid_for */
         );
 
-        let region = region.ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, format!("missing REGION {}", url))
-        })?;
-	let storage_class = storage_class.or(Some("STANDARD".to_owned()));
+        let region = match provider {
+            S3Provider::AWS => {
+                let r = region.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("missing region for provider {:?}", provider),
+                    )
+                })?;
+                r.parse::<region::Region>().map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid region format {}: {}", r, e),
+                    )
+                })?
+            }
+            S3Provider::Aliyun => {
+                let r = region.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("missing region for provider {:?}", provider),
+                    )
+                })?;
+                region::Region::Custom {
+                    name: r.clone(),
+                    endpoint: format!("https://oss-{}.aliyuncs.com", r),
+                }
+            }
+            _ => {
+                let scheme = if insecure { "http" } else { "https" };
+                let endpoint = endpoint.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("missing endpoint for provider {:?}", provider),
+                    )
+                })?;
+                region::Region::Custom {
+                    name: region.unwrap_or(String::new()),
+                    endpoint: format!("{}://{}", scheme, endpoint),
+                }
+            }
+        };
 
-	location_constraint = location_constraint.or(Some(region.name().to_string()));
-	let bucket_config = CreateBucketConfiguration{location_constraint: location_constraint};
+        location_constraint = location_constraint.or(Some(region.name().to_string()));
+        let bucket_config = CreateBucketConfiguration {
+            location_constraint: location_constraint,
+        };
 
         let client = S3Client::new_with(dispatcher, static_cred, region);
 
+        let bucket = bucket.to_string();
+        let prefix = prefix.map(|p| p.trim().trim_matches('/').to_string());
         // Try to create bucket first.
         let req = CreateBucketRequest {
             bucket: bucket.clone(),
-	    acl: acl.clone(),
-	    create_bucket_configuration: Some(bucket_config),
+            acl: acl.clone(),
+            create_bucket_configuration: Some(bucket_config),
             ..Default::default()
         };
         client
@@ -145,19 +199,20 @@ impl S3Storage {
             .map_err(|e| Error::new(ErrorKind::Other, format!("failed to create bucket {}", e)))?;
 
         Ok(S3Storage {
+            provider,
             bucket,
-	    storage_class,
-	    acl,
+            server_side_encryption,
+            storage_class,
+            acl,
             prefix,
             client,
         })
     }
 
     fn maybe_prefix_key(&self, key: &str) -> String {
-        if self.prefix.is_empty() {
-            key.to_owned()
-        } else {
-            format!("{}/{}", self.prefix, key)
+        match &self.prefix {
+            Some(p) => format!("{}/{}", p, key),
+            None => key.to_owned(),
         }
     }
 }
@@ -172,8 +227,9 @@ impl ExternalStorage for S3Storage {
             key,
             bucket: self.bucket.clone(),
             body: Some(content.into()),
-	    acl: self.acl.clone(),
-	    storage_class: self.storage_class.clone(),
+            acl: self.acl.clone(),
+            server_side_encryption: self.server_side_encryption.clone(),
+            storage_class: self.storage_class.clone(),
             ..Default::default()
         };
         self.client
