@@ -74,7 +74,6 @@ impl S3Storage {
         let mut token = None;
         let mut region = None;
         let mut acl = None;
-        let mut location_constraint = None;
         let mut storage_class = Some("STANDARD".to_owned());
         let mut provider = S3Provider::AWS;
         let mut insecure = false;
@@ -98,9 +97,6 @@ impl S3Storage {
                 }
                 "storage_class" => {
                     storage_class = Some(v.into_owned());
-                }
-                "location_constraint" => {
-                    location_constraint = Some(v.into_owned());
                 }
                 "provider" => {
                     provider = S3Provider::from(v.as_ref());
@@ -177,26 +173,10 @@ impl S3Storage {
             }
         };
 
-        location_constraint = location_constraint.or(Some(region.name().to_string()));
-        let bucket_config = CreateBucketConfiguration {
-            location_constraint: location_constraint,
-        };
-
         let client = S3Client::new_with(dispatcher, static_cred, region);
 
         let bucket = bucket.to_string();
         let prefix = prefix.map(|p| p.trim().trim_matches('/').to_string());
-        // Try to create bucket first.
-        let req = CreateBucketRequest {
-            bucket: bucket.clone(),
-            acl: acl.clone(),
-            create_bucket_configuration: Some(bucket_config),
-            ..Default::default()
-        };
-        client
-            .create_bucket(req)
-            .sync()
-            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to create bucket {}", e)))?;
 
         Ok(S3Storage {
             provider,
